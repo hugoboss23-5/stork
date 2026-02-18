@@ -39,6 +39,7 @@ mcp = FastMCP(
 _manager: CampaignManager | None = None
 _running_agents: dict[str, AgentTrace] = {}
 _overnight_task: asyncio.Task | None = None
+_MAX_AGENT_TRACES = 100
 
 
 def _get_manager() -> CampaignManager:
@@ -46,6 +47,16 @@ def _get_manager() -> CampaignManager:
     if _manager is None:
         _manager = CampaignManager()
     return _manager
+
+
+def _track_agent(trace: AgentTrace):
+    """Register a trace and prune oldest entries if over cap."""
+    _running_agents[trace.id] = trace
+    if len(_running_agents) > _MAX_AGENT_TRACES:
+        # Drop oldest entries (dict preserves insertion order)
+        excess = len(_running_agents) - _MAX_AGENT_TRACES
+        for key in list(_running_agents)[:excess]:
+            del _running_agents[key]
 
 
 # ──────────────────────────────────────────────
@@ -56,7 +67,7 @@ def _get_manager() -> CampaignManager:
 async def spawn(task: str) -> str:
     """NOW lane. Single agent, returns trace + result."""
     trace = await run_claude(task, topology="solo")
-    _running_agents[trace.id] = trace
+    _track_agent(trace)
     record_activity()
 
     if trace.succeeded():
@@ -87,7 +98,7 @@ async def spawn_many(tasks: list[str]) -> str:
 
     traces = await run_many(tasks)
     for t in traces:
-        _running_agents[t.id] = t
+        _track_agent(t)
     record_activity()
 
     results = []
@@ -117,7 +128,7 @@ async def chain(steps: list[str]) -> str:
 
     traces = await run_chain(steps)
     for t in traces:
-        _running_agents[t.id] = t
+        _track_agent(t)
     record_activity()
 
     results = []
@@ -197,15 +208,26 @@ async def campaign_create(goal: str, lane: str = "tonight") -> str:
     if lane.lower() not in valid_lanes:
         return json.dumps({"error": f"Invalid lane. Choose: {', '.join(valid_lanes)}"})
 
+    # TODO: WATCH lane has no implementation yet (v0.1) — campaigns are created
+    # but never polled or triggered. Needs a watcher loop that periodically
+    # checks a condition and activates the campaign when met.
     c = mgr.create_campaign(goal=goal, lane=lane.lower())
     record_activity()
 
-    # If NOW lane, plan and run immediately
+    # If NOW lane, plan and run all steps to completion
     if lane.lower() == "now":
         c = await mgr.plan_campaign(c)
-        step = c.next_step()
-        if step:
-            await mgr.execute_step(c, step)
+        c.status = Status.ACTIVE
+        while True:
+            step = c.next_step()
+            if step is None:
+                break
+            trace = await mgr.execute_step(c, step)
+            if c.over_budget() or c.status in (Status.BLOCKED, Status.FAILED):
+                break
+        # Finalize if all steps are done
+        if c.next_step() is None and c.status not in (Status.COMPLETE, Status.FAILED):
+            await mgr._complete(c)
 
     return json.dumps({
         "campaign_id": c.id,
@@ -297,9 +319,13 @@ async def overnight_start() -> str:
                 from stork.sitrep import save_sitrep
                 save_sitrep(content)
 
+            # Persist overnight results so sitrep/status can reference them
+            _save_overnight_results(results)
+
             return results
         except Exception as e:
             _log(f"Overnight run error: {e}")
+            _save_overnight_results([], error=str(e))
             return []
 
     _overnight_task = asyncio.create_task(_run_overnight())
@@ -382,7 +408,7 @@ async def status() -> str:
 
     overnight_running = _overnight_task is not None and not _overnight_task.done()
 
-    return json.dumps({
+    result = {
         "agents": {
             "running": len(running),
             "done": len(done),
@@ -396,7 +422,13 @@ async def status() -> str:
             "by_lane": _count_by(campaigns, "lane"),
         },
         "overnight_running": overnight_running,
-    }, indent=2)
+    }
+
+    last_overnight = _load_overnight_results()
+    if last_overnight:
+        result["last_overnight"] = last_overnight
+
+    return json.dumps(result, indent=2)
 
 
 def _count_by(items: list, attr: str) -> dict:
@@ -405,6 +437,38 @@ def _count_by(items: list, attr: str) -> dict:
         val = getattr(item, attr, "?")
         counts[val] = counts.get(val, 0) + 1
     return counts
+
+
+def _save_overnight_results(results: list, error: str = ""):
+    """Persist overnight results to disk for sitrep/status access."""
+    from stork.conviction import STORK_HOME
+    path = STORK_HOME / "last_overnight.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "results": [
+                {"campaign_id": r[0], "status": r[1]} if isinstance(r, tuple)
+                else r
+                for r in results
+            ],
+            "error": error,
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_overnight_results() -> dict | None:
+    """Load last overnight results from disk."""
+    from stork.conviction import STORK_HOME
+    path = STORK_HOME / "last_overnight.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _log(msg: str):
