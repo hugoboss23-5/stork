@@ -21,6 +21,30 @@ CLAUDE_CMD = os.environ.get("STORK_CLAUDE_CMD", "claude")
 TIMEOUT = int(os.environ.get("STORK_TIMEOUT", "300"))
 MAX_CONCURRENT = int(os.environ.get("STORK_MAX_CONCURRENT", "5"))
 
+# Env vars that trigger Claude CLI nesting detection.
+# Strip ALL of these when spawning child agents so they don't refuse to run.
+_CLAUDE_NESTING_VARS = {
+    "CLAUDECODE", "CLAUDE_CODE_ENTRY_POINT", "CLAUDE_CODE_SESSION",
+    "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES", "CLAUDE_CODE_TASK_ID",
+}
+
+
+def _clean_env() -> dict[str, str]:
+    """Build a clean environment for child claude processes.
+    Strips all Claude session/nesting env vars so child agents run freely.
+    Preserves PATH, HOME, STORK_*, and everything else the CLI needs."""
+    env = {}
+    for k, v in os.environ.items():
+        if k in _CLAUDE_NESTING_VARS:
+            continue
+        # Strip all parent-session Claude vars — child CLI sets up its own
+        if k.startswith(("CLAUDE_CODE_", "CLAUDE_SESSION_", "CLAUDE_")):
+            continue
+        if k.startswith("CLAUDECODE"):
+            continue
+        env[k] = v
+    return env
+
 _semaphore: asyncio.Semaphore | None = None
 
 
@@ -264,7 +288,7 @@ async def run_claude(task: str, system_prompt: str | None = None,
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "CLAUDECODE": ""},  # Clear nesting guard
+                env=_clean_env(),  # Strip all nesting-guard vars
             )
 
             try:

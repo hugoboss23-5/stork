@@ -435,10 +435,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stork Campaign Engine — MCP Server")
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--max-concurrent", type=int, default=5)
+    parser.add_argument("--stdio", action="store_true",
+                        help="Run with stdio transport (used by Claude Code MCP)")
     args = parser.parse_args()
-
-    mcp.settings.port = args.port
-    mcp.settings.host = HOST
 
     # Update concurrency
     from stork import trace
@@ -448,5 +447,12 @@ if __name__ == "__main__":
     import atexit
     atexit.register(_cleanup)
 
-    print(f"Stork MCP on {HOST}:{args.port}, max {args.max_concurrent} concurrent agents")
-    mcp.run(transport="streamable-http")
+    if args.stdio:
+        # stdio transport — Claude Code spawns this process and talks over stdin/stdout
+        mcp.run(transport="stdio")
+    else:
+        # HTTP transport — standalone server mode
+        mcp.settings.port = args.port
+        mcp.settings.host = HOST
+        print(f"Stork MCP on {HOST}:{args.port}, max {args.max_concurrent} concurrent agents")
+        mcp.run(transport="streamable-http")

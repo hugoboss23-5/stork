@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "stork": {
+      "command": "python3",
+      "args": ["-m", "stork.server", "--stdio"],
+      "cwd": "/home/user/stork"
+    }
+  }
+}
