@@ -14,7 +14,7 @@ from datetime import datetime, timezone, date
 from pathlib import Path
 
 STORK_HOME = Path(os.environ.get("STORK_HOME", os.path.expanduser("~/.stork")))
-SITREPS_DIR = Path(os.environ.get("STORK_SITREPS_DIR", "stork/sitreps"))
+SITREPS_DIR = Path(os.environ.get("STORK_SITREPS_DIR", str(STORK_HOME / "sitreps")))
 SITREP_MODEL = os.environ.get("STORK_SITREP_MODEL", "claude-haiku-4-5-20251001")
 
 SITREP_PROMPT = """You are Stork writing a morning sit-rep for Hugo. Be direct, specific, concise.

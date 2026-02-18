@@ -24,7 +24,7 @@ from stork.conviction import (
 )
 
 STORK_HOME = Path(os.environ.get("STORK_HOME", os.path.expanduser("~/.stork")))
-CAMPAIGNS_DIR = Path(os.environ.get("STORK_CAMPAIGNS_DIR", "stork/campaigns"))
+CAMPAIGNS_DIR = Path(os.environ.get("STORK_CAMPAIGNS_DIR", str(STORK_HOME / "campaigns")))
 PLANNING_MODEL = os.environ.get("STORK_PLANNING_MODEL", "claude-haiku-4-5-20251001")
 
 DEFAULT_BUDGET_PER_NIGHT = 2.00  # dollars
@@ -381,6 +381,10 @@ Example: [{{"description": "Search for X and compile findings"}}, {{"description
         campaign.traces = pruned
 
         self._save(campaign)
+
+        # Unblock parent campaign if this was a sub-campaign
+        if campaign.parent_campaign_id:
+            self.unblock_parent(campaign.id)
 
     def _write_post_mortem(self, campaign: Campaign) -> str:
         """Generate a post-mortem for a failed campaign."""
