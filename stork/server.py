@@ -18,11 +18,14 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+import traceback
+
 from stork.trace import run_claude, run_many, run_chain, AgentTrace
 from stork.campaign import CampaignManager, Campaign, Lane, Status
 from stork.conviction import format_convictions_for_context, load_convictions
 from stork.sitrep import create_sitrep, load_sitrep, generate_sitrep, save_sitrep
 from stork.boredom import check_and_propose, record_activity
+from stork.profiles import list_profiles, load_profiles
 
 PORT = int(os.environ.get("STORK_PORT", "8000"))
 HOST = "127.0.0.1"
@@ -64,136 +67,282 @@ def _track_agent(trace: AgentTrace):
 # ──────────────────────────────────────────────
 
 @mcp.tool()
-async def spawn(task: str) -> str:
-    """NOW lane. Single agent, returns trace + result."""
-    trace = await run_claude(task, topology="solo")
-    _track_agent(trace)
-    record_activity()
-
-    if trace.succeeded():
-        return json.dumps({
-            "status": "done",
-            "agent_id": trace.id,
-            "response": trace.response,
-            "thinking": trace.thinking[:2000] if trace.thinking else "",
-            "cost_usd": trace.cost_usd,
-            "duration_ms": trace.duration_ms,
-            "tokens": {"in": trace.tokens_in, "out": trace.tokens_out},
-        }, indent=2)
-    else:
-        return json.dumps({
-            "status": trace.status,
-            "agent_id": trace.id,
-            "errors": trace.errors,
-            "cost_usd": trace.cost_usd,
-            "duration_ms": trace.duration_ms,
-        }, indent=2)
-
-
-@mcp.tool()
-async def spawn_many(tasks: list[str]) -> str:
-    """NOW lane. Parallel agents, returns all traces."""
-    if len(tasks) > 10:
-        return json.dumps({"error": "Max 10 parallel tasks."})
-
-    traces = await run_many(tasks)
-    for t in traces:
-        _track_agent(t)
-    record_activity()
-
-    results = []
-    for task_str, trace in zip(tasks, traces):
-        results.append({
-            "task": task_str[:100],
-            "agent_id": trace.id,
-            "status": trace.status,
-            "response": trace.response[:3000] if trace.response else "",
-            "errors": trace.errors,
-            "cost_usd": trace.cost_usd,
-        })
-
-    total_cost = sum(t.cost_usd for t in traces)
-    return json.dumps({
-        "agents": len(traces),
-        "total_cost_usd": total_cost,
-        "results": results,
-    }, indent=2)
-
-
-@mcp.tool()
-async def chain(steps: list[str]) -> str:
-    """NOW lane. Sequential pipeline, each step gets previous output."""
-    if len(steps) > 7:
-        return json.dumps({"error": "Max 7 chain steps."})
-
-    traces = await run_chain(steps)
-    for t in traces:
-        _track_agent(t)
-    record_activity()
-
-    results = []
-    for step_str, trace in zip(steps, traces):
-        results.append({
-            "step": step_str[:100],
-            "agent_id": trace.id,
-            "status": trace.status,
-            "response": trace.response[:3000] if trace.response else "",
-            "errors": trace.errors,
-        })
-
-    total_cost = sum(t.cost_usd for t in traces)
-    return json.dumps({
-        "steps_completed": len(traces),
-        "steps_total": len(steps),
-        "total_cost_usd": total_cost,
-        "results": results,
-    }, indent=2)
-
-
-@mcp.tool()
-async def delegate(goal: str, num_agents: int = 3) -> str:
-    """NOW lane. Full orchestration: plan → parallel execute → synthesize."""
-    num_agents = min(max(num_agents, 2), 5)
-
-    # Plan
-    plan_trace = await run_claude(
-        f"Break this goal into exactly {num_agents} independent subtasks. "
-        f"Return ONLY a JSON array of strings, no other text.\n\nGoal: {goal}",
-        topology="delegate:planner",
-    )
-
+async def spawn(task: str, timeout_seconds: int = 0, profile: str = "") -> str:
+    """NOW lane. Single agent. Optional timeout_seconds and profile (e.g. 'quant', 'research', 'code', 'fast')."""
     try:
-        raw = plan_trace.response
-        start = raw.index("[")
-        end = raw.rindex("]") + 1
-        subtasks = json.loads(raw[start:end])
-        if not isinstance(subtasks, list) or not subtasks:
-            raise ValueError("Empty")
-    except (ValueError, json.JSONDecodeError):
-        subtasks = [f"Part {i+1} of '{goal}'" for i in range(num_agents)]
+        timeout = timeout_seconds if timeout_seconds > 0 else None
+        trace = await run_claude(task, topology="solo", timeout=timeout, profile=profile)
+        _track_agent(trace)
+        record_activity()
 
-    # Execute
-    traces = await run_many(subtasks)
+        if trace.succeeded():
+            return json.dumps({
+                "status": "done",
+                "agent_id": trace.id,
+                "response": trace.response,
+                "thinking": trace.thinking[:2000] if trace.thinking else "",
+                "cost_usd": trace.cost_usd,
+                "duration_ms": trace.duration_ms,
+                "tokens": {"in": trace.tokens_in, "out": trace.tokens_out},
+            }, indent=2)
+        else:
+            return json.dumps({
+                "status": trace.status,
+                "agent_id": trace.id,
+                "errors": trace.errors,
+                "stderr": getattr(trace, "_stderr", ""),
+                "cost_usd": trace.cost_usd,
+                "duration_ms": trace.duration_ms,
+            }, indent=2)
+    except Exception as e:
+        _log(f"spawn error: {e}")
+        return json.dumps({
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-500:],
+        }, indent=2)
 
-    # Synthesize
-    synthesis_input = f"ORIGINAL GOAL: {goal}\n\n"
-    for i, (task_str, trace) in enumerate(zip(subtasks, traces)):
-        synthesis_input += f"--- SUBTASK {i+1}: {task_str} ---\n{trace.response[:2000]}\n\n"
-    synthesis_input += "Synthesize all subtask results into a single coherent response."
 
-    synth_trace = await run_claude(synthesis_input, topology="delegate:synthesizer")
-    record_activity()
+@mcp.tool()
+async def spawn_many(tasks: list[str], timeout_seconds: int = 0, profile: str = "") -> str:
+    """NOW lane. Parallel agents. Returns per-agent status so you can see WHICH failed and WHY."""
+    try:
+        if len(tasks) > 10:
+            return json.dumps({"error": "Max 10 parallel tasks."})
 
-    all_traces = [plan_trace] + list(traces) + [synth_trace]
-    total_cost = sum(t.cost_usd for t in all_traces)
+        timeout = timeout_seconds if timeout_seconds > 0 else None
+        traces = await run_many(tasks, timeout=timeout, profile=profile)
+        for t in traces:
+            _track_agent(t)
+        record_activity()
 
-    return json.dumps({
-        "goal": goal,
-        "agents_used": len(subtasks) + 2,
-        "total_cost_usd": total_cost,
-        "subtasks": subtasks,
-        "result": synth_trace.response[:5000],
-    }, indent=2)
+        results = []
+        for task_str, trace in zip(tasks, traces):
+            entry = {
+                "task": task_str[:200],
+                "agent_id": trace.id,
+                "status": trace.status,
+                "response": trace.response[:3000] if trace.response else "",
+                "cost_usd": trace.cost_usd,
+                "duration_ms": trace.duration_ms,
+            }
+            if trace.errors:
+                entry["errors"] = trace.errors
+            if hasattr(trace, "_stderr") and trace._stderr:
+                entry["stderr"] = trace._stderr[:500]
+            results.append(entry)
+
+        succeeded = sum(1 for t in traces if t.succeeded())
+        total_cost = sum(t.cost_usd for t in traces)
+        return json.dumps({
+            "agents": len(traces),
+            "succeeded": succeeded,
+            "failed": len(traces) - succeeded,
+            "total_cost_usd": total_cost,
+            "results": results,
+        }, indent=2)
+    except Exception as e:
+        _log(f"spawn_many error: {e}")
+        return json.dumps({
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-500:],
+        }, indent=2)
+
+
+@mcp.tool()
+async def chain(steps: list[str], timeout_seconds: int = 0, profile: str = "") -> str:
+    """NOW lane. Sequential pipeline. Shows all steps including ones that didn't run if chain broke."""
+    try:
+        if len(steps) > 7:
+            return json.dumps({"error": "Max 7 chain steps."})
+
+        timeout = timeout_seconds if timeout_seconds > 0 else None
+        traces = await run_chain(steps, timeout=timeout, profile=profile)
+        for t in traces:
+            _track_agent(t)
+        record_activity()
+
+        results = []
+        for i, step_str in enumerate(steps):
+            if i < len(traces):
+                trace = traces[i]
+                entry = {
+                    "step": step_str[:200],
+                    "agent_id": trace.id,
+                    "status": trace.status,
+                    "response": trace.response[:3000] if trace.response else "",
+                }
+                if trace.errors:
+                    entry["errors"] = trace.errors
+                if hasattr(trace, "_stderr") and trace._stderr:
+                    entry["stderr"] = trace._stderr[:500]
+            else:
+                entry = {
+                    "step": step_str[:200],
+                    "agent_id": None,
+                    "status": "not_run",
+                    "response": "",
+                    "errors": ["Chain broke before this step"],
+                }
+            results.append(entry)
+
+        total_cost = sum(t.cost_usd for t in traces)
+        chain_broke = len(traces) < len(steps)
+        return json.dumps({
+            "steps_completed": sum(1 for t in traces if t.succeeded()),
+            "steps_attempted": len(traces),
+            "steps_total": len(steps),
+            "chain_broke": chain_broke,
+            "total_cost_usd": total_cost,
+            "results": results,
+        }, indent=2)
+    except Exception as e:
+        _log(f"chain error: {e}")
+        return json.dumps({
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-500:],
+        }, indent=2)
+
+
+@mcp.tool()
+async def delegate(goal: str, num_agents: int = 3, timeout_seconds: int = 0, profile: str = "") -> str:
+    """NOW lane. Plan → parallel execute → synthesize. Reports which phase failed and why."""
+    try:
+        num_agents = min(max(num_agents, 2), 5)
+        timeout = timeout_seconds if timeout_seconds > 0 else None
+
+        # ── Phase 1: Plan ──
+        _log(f"delegate: planning with {num_agents} agents for: {goal[:80]}")
+        plan_trace = await run_claude(
+            f"Break this goal into exactly {num_agents} independent subtasks. "
+            f"Return ONLY a JSON array of strings, no other text.\n\nGoal: {goal}",
+            topology="delegate:planner",
+            timeout=timeout,
+            profile=profile,
+        )
+
+        if not plan_trace.succeeded():
+            return json.dumps({
+                "status": "error",
+                "phase": "planning",
+                "error": "; ".join(plan_trace.errors) or "Planner failed with no error detail",
+                "agent_id": plan_trace.id,
+                "cost_usd": plan_trace.cost_usd,
+                "duration_ms": plan_trace.duration_ms,
+            }, indent=2)
+
+        try:
+            raw = plan_trace.response
+            start = raw.index("[")
+            end = raw.rindex("]") + 1
+            subtasks = json.loads(raw[start:end])
+            if not isinstance(subtasks, list) or not subtasks:
+                raise ValueError("Empty")
+        except (ValueError, json.JSONDecodeError):
+            subtasks = [f"Part {i+1} of '{goal}'" for i in range(num_agents)]
+
+        # ── Phase 2: Execute ──
+        _log(f"delegate: executing {len(subtasks)} subtasks")
+        worker_traces = await run_many(subtasks, timeout=timeout, profile=profile)
+
+        succeeded_workers = []
+        failed_workers = []
+        for subtask, trace in zip(subtasks, worker_traces):
+            if trace.succeeded():
+                succeeded_workers.append((subtask, trace))
+            else:
+                failed_workers.append((subtask, trace))
+
+        if not succeeded_workers:
+            # ALL workers failed
+            return json.dumps({
+                "status": "error",
+                "phase": "execution",
+                "error": "All worker agents failed",
+                "failed_subtasks": [
+                    {
+                        "task": s[:200],
+                        "agent_id": t.id,
+                        "status": t.status,
+                        "errors": t.errors,
+                    }
+                    for s, t in failed_workers
+                ],
+                "cost_usd": sum(t.cost_usd for t in worker_traces) + plan_trace.cost_usd,
+            }, indent=2)
+
+        # ── Phase 3: Synthesize ──
+        _log(f"delegate: synthesizing ({len(succeeded_workers)} succeeded, {len(failed_workers)} failed)")
+        synthesis_input = f"ORIGINAL GOAL: {goal}\n\n"
+        for i, (subtask, trace) in enumerate(succeeded_workers):
+            synthesis_input += f"--- SUBTASK: {subtask} ---\n{trace.response[:2000]}\n\n"
+        if failed_workers:
+            synthesis_input += f"NOTE: {len(failed_workers)} subtask(s) failed and are not included.\n\n"
+        synthesis_input += "Synthesize all subtask results into a single coherent response."
+
+        synth_trace = await run_claude(synthesis_input, topology="delegate:synthesizer",
+                                       timeout=timeout, profile=profile)
+
+        if not synth_trace.succeeded():
+            return json.dumps({
+                "status": "error",
+                "phase": "synthesis",
+                "error": "; ".join(synth_trace.errors) or "Synthesizer failed with no error detail",
+                "agent_id": synth_trace.id,
+                "partial_results": [t.response[:1000] for _, t in succeeded_workers],
+                "cost_usd": sum(t.cost_usd for t in worker_traces) + plan_trace.cost_usd + synth_trace.cost_usd,
+            }, indent=2)
+
+        record_activity()
+
+        all_traces = [plan_trace] + list(worker_traces) + [synth_trace]
+        total_cost = sum(t.cost_usd for t in all_traces)
+
+        result = {
+            "status": "done",
+            "goal": goal,
+            "agents_used": len(subtasks) + 2,
+            "succeeded_workers": len(succeeded_workers),
+            "failed_workers": len(failed_workers),
+            "total_cost_usd": total_cost,
+            "subtasks": subtasks,
+            "result": synth_trace.response[:5000],
+        }
+
+        if failed_workers:
+            result["warnings"] = [
+                f"Subtask failed: {s[:80]} ({t.status}: {'; '.join(t.errors[:2])})"
+                for s, t in failed_workers
+            ]
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        _log(f"delegate error: {e}")
+        return json.dumps({
+            "status": "error",
+            "phase": "unknown",
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-500:],
+        }, indent=2)
+
+
+# ──────────────────────────────────────────────
+# Profile tools
+# ──────────────────────────────────────────────
+
+@mcp.tool()
+async def profiles() -> str:
+    """List available agent profiles with their system prompts and timeouts."""
+    all_profiles = load_profiles()
+    result = {}
+    for name, spec in sorted(all_profiles.items()):
+        result[name] = {
+            "system_prompt": (spec.get("system_prompt") or "(default)")[:200],
+            "timeout": spec.get("timeout", 300),
+        }
+    return json.dumps(result, indent=2)
 
 
 # ──────────────────────────────────────────────
@@ -396,12 +545,30 @@ async def sitrep(date_str: str = "") -> str:
 
 @mcp.tool()
 async def status() -> str:
-    """All agents currently running + campaign overview."""
+    """All agents currently running + campaign overview + elapsed time for running agents."""
     mgr = _get_manager()
+    now = datetime.now(timezone.utc)
 
     running = {k: v for k, v in _running_agents.items() if v.status == "running"}
     done = {k: v for k, v in _running_agents.items() if v.status == "done"}
     errored = {k: v for k, v in _running_agents.items() if v.status in ("error", "timeout")}
+
+    # Show detail for running agents including elapsed time
+    running_detail = []
+    for tid, trace in running.items():
+        elapsed_s = 0
+        if trace.started_at:
+            try:
+                started = datetime.fromisoformat(trace.started_at)
+                elapsed_s = int((now - started).total_seconds())
+            except (ValueError, TypeError):
+                pass
+        running_detail.append({
+            "agent_id": tid,
+            "task": trace.task[:100],
+            "topology": trace.topology_position,
+            "elapsed_seconds": elapsed_s,
+        })
 
     campaigns = mgr.list_all()
     active_campaigns = [c for c in campaigns if c.status in ("active", "queued")]
@@ -411,6 +578,7 @@ async def status() -> str:
     result = {
         "agents": {
             "running": len(running),
+            "running_detail": running_detail,
             "done": len(done),
             "errored": len(errored),
             "total": len(_running_agents),

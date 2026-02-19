@@ -258,14 +258,45 @@ def parse_trace(raw_output: str, task: str, trace_id: str = "",
 
 
 async def run_claude(task: str, system_prompt: str | None = None,
-                     topology: str = "solo", timeout: int | None = None) -> AgentTrace:
+                     topology: str = "solo", timeout: int | None = None,
+                     retries: int = 1, profile: str = "") -> AgentTrace:
     """
     Spawn one Claude Code CLI instance with --output-format json.
     Returns AgentTrace — always, even on failure/timeout/garbage.
+    Retries transient failures up to `retries` times (default 1 = two attempts total).
+    Profile loads a preset system_prompt + timeout from profiles.py.
     """
+    # Resolve profile settings
+    if profile:
+        from stork.profiles import get_profile
+        p = get_profile(profile)
+        if p:
+            if system_prompt is None:
+                system_prompt = p.get("system_prompt")
+            if timeout is None:
+                timeout = p.get("timeout")
+
+    timeout = timeout or TIMEOUT
+
+    last_trace = None
+    for attempt in range(retries + 1):
+        trace = await _run_claude_once(task, system_prompt, topology, timeout)
+        if trace.succeeded() or attempt == retries:
+            if attempt > 0 and trace.succeeded():
+                trace.errors.insert(0, f"Succeeded on retry {attempt}")
+            return trace
+        last_trace = trace
+        # Brief backoff before retry
+        await asyncio.sleep(min(2 ** attempt, 4))
+
+    return last_trace  # Unreachable, but satisfies type checker
+
+
+async def _run_claude_once(task: str, system_prompt: str | None,
+                           topology: str, timeout: int) -> AgentTrace:
+    """Single attempt to run Claude CLI. No retry logic."""
     trace_id = str(uuid.uuid4())[:8]
     started_at = datetime.now(timezone.utc).isoformat()
-    timeout = timeout or TIMEOUT
 
     sem = _get_semaphore()
 
@@ -313,6 +344,12 @@ async def run_claude(task: str, system_prompt: str | None = None,
                 parsed.errors = [err or f"Exit code {proc.returncode}"]
                 parsed.status = "error"
 
+            # Always capture stderr if present — even on success, for diagnostics
+            if err and not parsed.errors:
+                parsed.errors = []
+            if err:
+                parsed._stderr = err
+
             return parsed
 
         except FileNotFoundError:
@@ -322,22 +359,42 @@ async def run_claude(task: str, system_prompt: str | None = None,
             return trace
         except Exception as e:
             trace.status = "error"
-            trace.errors = [str(e)]
+            trace.errors = [f"{type(e).__name__}: {e}"]
             trace.finished_at = datetime.now(timezone.utc).isoformat()
             return trace
 
 
-async def run_many(tasks: list[str], system_prompt: str | None = None) -> list[AgentTrace]:
-    """Parallel spawn. Each gets a topology position."""
+async def run_many(tasks: list[str], system_prompt: str | None = None,
+                   timeout: int | None = None, retries: int = 1,
+                   profile: str = "") -> list[AgentTrace]:
+    """Parallel spawn. Each gets a topology position. Exceptions become error traces."""
     n = len(tasks)
     coros = [
-        run_claude(t, system_prompt=system_prompt, topology=f"parallel:{i+1}/{n}")
+        run_claude(t, system_prompt=system_prompt, topology=f"parallel:{i+1}/{n}",
+                   timeout=timeout, retries=retries, profile=profile)
         for i, t in enumerate(tasks)
     ]
-    return await asyncio.gather(*coros)
+    results = await asyncio.gather(*coros, return_exceptions=True)
+
+    traces = []
+    for i, result in enumerate(results):
+        if isinstance(result, BaseException):
+            traces.append(AgentTrace(
+                id=str(uuid.uuid4())[:8],
+                task=tasks[i][:500],
+                status="error",
+                errors=[f"{type(result).__name__}: {result}"],
+                topology_position=f"parallel:{i+1}/{n}",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            ))
+        else:
+            traces.append(result)
+    return traces
 
 
-async def run_chain(steps: list[str], system_prompt: str | None = None) -> list[AgentTrace]:
+async def run_chain(steps: list[str], system_prompt: str | None = None,
+                    timeout: int | None = None, retries: int = 1,
+                    profile: str = "") -> list[AgentTrace]:
     """Sequential pipeline. Each step gets previous output as context."""
     traces = []
     context = ""
@@ -350,7 +407,8 @@ async def run_chain(steps: list[str], system_prompt: str | None = None) -> list[
             full_task = f"YOUR TASK (step {i+1}/{n}): {step}"
 
         trace = await run_claude(full_task, system_prompt=system_prompt,
-                                 topology=f"chain:{i+1}/{n}")
+                                 topology=f"chain:{i+1}/{n}",
+                                 timeout=timeout, retries=retries, profile=profile)
         traces.append(trace)
 
         if trace.succeeded():
