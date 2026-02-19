@@ -2,7 +2,7 @@
 Stork Server — The MCP interface.
 ===================================
 Replaces agent_army.py completely. Same base tools, upgraded with campaigns.
-Binds 127.0.0.1 NOT 0.0.0.0.
+HTTP mode binds 0.0.0.0 for tunnel access; stdio mode for Claude Code MCP.
 On shutdown: kill all child processes properly.
 
 Hugo & Watty · February 2026
@@ -28,7 +28,7 @@ from stork.boredom import check_and_propose, record_activity
 from stork.profiles import list_profiles, load_profiles
 
 PORT = int(os.environ.get("STORK_PORT", "8000"))
-HOST = "127.0.0.1"
+HOST = os.environ.get("STORK_HOST", "0.0.0.0")
 
 mcp = FastMCP(
     name="stork",
@@ -683,8 +683,46 @@ if __name__ == "__main__":
         # stdio transport — Claude Code spawns this process and talks over stdin/stdout
         mcp.run(transport="stdio")
     else:
-        # HTTP transport — standalone server mode
+        # HTTP transport with CORS for tunnel/remote access (Claude.ai)
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.cors import CORSMiddleware
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route, Mount
+
+        async def health(request):
+            return JSONResponse({
+                "status": "ok",
+                "service": "stork",
+                "version": "0.1",
+            })
+
         mcp.settings.port = args.port
         mcp.settings.host = HOST
+
+        # Get the MCP Starlette app, then wrap it with CORS + health check
+        mcp_app = mcp.streamable_http_app()
+
+        app = Starlette(
+            routes=[
+                Route("/", health),
+                Route("/health", health),
+                Mount("/", app=mcp_app),
+            ],
+            middleware=[
+                Middleware(
+                    CORSMiddleware,
+                    allow_origins=["*"],
+                    allow_methods=["*"],
+                    allow_headers=["*"],
+                    allow_credentials=False,
+                ),
+            ],
+        )
+
         print(f"Stork MCP on {HOST}:{args.port}, max {args.max_concurrent} concurrent agents")
-        mcp.run(transport="streamable-http")
+        print(f"  MCP endpoint: http://{HOST}:{args.port}/mcp")
+        print(f"  Health check: http://{HOST}:{args.port}/")
+        print(f"  CORS: all origins allowed")
+        uvicorn.run(app, host=HOST, port=args.port)
