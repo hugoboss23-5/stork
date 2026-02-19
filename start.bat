@@ -1,37 +1,39 @@
 @echo off
 REM ─────────────────────────────────────────────
-REM  Stork Startup — Server + Cloudflare Tunnel
+REM  Stork Startup — Server + ngrok Tunnel
 REM ─────────────────────────────────────────────
-REM  Starts the MCP server and cloudflared tunnel.
-REM  Ctrl+C kills both. Run from C:\Users\bulli\stork
+REM  Launches both processes minimized and exits.
+REM  Designed to run at Windows login via Startup folder.
 REM
 REM  Prerequisites:
 REM    1. Python 3.11+ with stork installed (pip install -e .)
-REM    2. cloudflared installed and tunnel "stork" created
+REM    2. ngrok installed and authenticated (ngrok config add-authtoken)
 REM    3. Claude CLI installed (for agent spawning)
 REM ─────────────────────────────────────────────
 
 REM CRITICAL: Without this, Claude.ai rejects the MCP connection
 set MCP_DISABLE_TRANSPORT_SECURITY=1
 
-REM Stork config (override via env vars before running this script)
-if not defined STORK_PORT set STORK_PORT=8000
-if not defined STORK_HOST set STORK_HOST=0.0.0.0
+REM Config
+set STORK_PORT=8000
+set STORK_HOST=0.0.0.0
+set NGROK_DOMAIN=cartographical-bari-unfeasible.ngrok-free.dev
 
-echo.
-echo  ============================================
-echo   STORK Campaign Engine — Starting up
-echo  ============================================
-echo.
+REM Kill any leftover processes from a previous run
+taskkill /f /fi "WINDOWTITLE eq StorkServer" >nul 2>&1
+taskkill /f /fi "WINDOWTITLE eq StorkTunnel" >nul 2>&1
 
-REM Start the MCP server in background
-echo [1/2] Starting Stork MCP server on %STORK_HOST%:%STORK_PORT%...
-start /b "StorkServer" python -m stork.server --port %STORK_PORT%
-timeout /t 2 /nobreak >nul
+REM Kill any old cloudflared tunnel processes (cleanup from previous setup)
+taskkill /f /im cloudflared.exe >nul 2>&1
 
-REM Start cloudflared tunnel in background
-echo [2/2] Starting Cloudflare tunnel...
-start /b "StorkTunnel" cloudflared tunnel run stork
+REM Start the MCP server in a minimized window
+start /min "StorkServer" cmd /c "cd /d C:\Users\bulli\stork && set MCP_DISABLE_TRANSPORT_SECURITY=1 && python -m stork.server --port %STORK_PORT%"
+
+REM Wait for server to be ready
+ping -n 4 127.0.0.1 >nul
+
+REM Start ngrok tunnel in a minimized window
+start /min "StorkTunnel" cmd /c "ngrok http --url=%NGROK_DOMAIN% %STORK_PORT%"
 
 echo.
 echo  ============================================
@@ -40,16 +42,11 @@ echo  ============================================
 echo.
 echo   MCP Server:  http://localhost:%STORK_PORT%/mcp
 echo   Health:      http://localhost:%STORK_PORT%/
-echo   Tunnel:      Check cloudflared output above for URL
+echo   Tunnel:      https://%NGROK_DOMAIN%/mcp
 echo.
-echo   To connect from Claude.ai:
-echo     1. Go to Claude.ai Settings ^> MCP Servers
-echo     2. Add server URL: https://YOUR-TUNNEL-URL/mcp
+echo   Claude.ai MCP URL: https://%NGROK_DOMAIN%/mcp
 echo.
-echo   Press Ctrl+C to stop everything.
+echo   To stop: close the StorkServer and StorkTunnel windows,
+echo            or run: taskkill /f /fi "WINDOWTITLE eq StorkServer"
+echo                    taskkill /f /fi "WINDOWTITLE eq StorkTunnel"
 echo.
-
-REM Wait for Ctrl+C, then kill both processes
-:wait
-timeout /t 5 /nobreak >nul
-goto wait
